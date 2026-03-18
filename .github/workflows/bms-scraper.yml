@@ -30,3 +30,11 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         run: python scraper.py
+
+      - name: Commit updated snapshot  # ← THIS IS WHAT WAS MISSING
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add known_events.json
+          git diff --cached --quiet || git commit -m "Update event snapshot"
+          git push
