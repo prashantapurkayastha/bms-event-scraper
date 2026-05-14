@@ -1,16 +1,21 @@
 import asyncio
+import base64
 import json
 import os
 import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from playwright.async_api import async_playwright, Browser
+from playwright.async_api import async_playwright, Browser, Page
 
-# Read from environment variables (set as GitHub Secrets)
+# ── Config ────────────────────────────────────────────────────────────────────
+
 SENDER_EMAIL    = os.environ["SENDER_EMAIL"]
 SENDER_PASSWORD = os.environ["SENDER_PASSWORD"]
 RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
+
+# Set DEBUG=1 in env to attach screenshots to the email on scrape failure
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 BMS_URL        = "https://in.bookmyshow.com/explore/events-mumbai?categories=music-shows"
 SKILLBOXES_URL = "https://www.skillboxes.com/events-mumbai"
@@ -23,216 +28,246 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Holds base64 debug screenshots if any scraper fails
+_debug_screenshots: list[dict] = []
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def slow_scroll(page: Page, rounds: int = 6, delay_ms: int = 1200) -> None:
+    for _ in range(rounds):
+        await page.evaluate("window.scrollBy(0, window.innerHeight)")
+        await page.wait_for_timeout(delay_ms)
+
+
+async def capture_debug(page: Page, label: str) -> None:
+    if not DEBUG:
+        return
+    try:
+        png = await page.screenshot(full_page=False)
+        _debug_screenshots.append({
+            "label": label,
+            "data": base64.b64encode(png).decode()
+        })
+        print(f"   📸 Debug screenshot captured: {label}")
+    except Exception:
+        pass
+
+
+def parse_card_lines(lines: list[str]) -> tuple[str, str, str]:
+    """Return (title, venue, price) from a card's text lines."""
+    title = lines[0] if lines else ""
+    venue = next(
+        (l for l in lines[1:] if l and "₹" not in l and not l.lower().startswith("free") and len(l) > 3),
+        "Venue TBA"
+    )
+    price = next(
+        (l for l in lines if "₹" in l or l.lower().startswith("free")),
+        ""
+    )
+    return title, venue, price
+
 
 # ── BookMyShow ────────────────────────────────────────────────────────────────
 
 async def scrape_bms(browser: Browser) -> list[dict]:
-    events = []
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 900},
-    )
-    page = await context.new_page()
+    events: list[dict] = []
+    ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 900})
+    page = await ctx.new_page()
     print("🌐 [BMS] Navigating...")
     try:
         await page.goto(BMS_URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_selector('a[href*="/events/"]', timeout=30000)
+        await slow_scroll(page)
 
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await page.wait_for_timeout(1200)
-
-        card_els = await page.query_selector_all('a[href*="/events/"]')
-        print(f"   ↳ {len(card_els)} cards found")
-
-        seen_titles: set[str] = set()
-        for card in card_els:
+        seen: set[str] = set()
+        for card in await page.query_selector_all('a[href*="/events/"]'):
             try:
-                inner_text = await card.inner_text()
-                lines = [l.strip() for l in inner_text.strip().split('\n') if l.strip()]
+                raw = await card.inner_text()
+                lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
                 if not lines:
                     continue
-                title = lines[0]
-                if not title or title in seen_titles:
+                title, venue, price = parse_card_lines(lines)
+                if not title or title in seen:
                     continue
-                seen_titles.add(title)
-                venue = lines[1] if len(lines) > 1 else "Venue TBA"
-                price = lines[3] if len(lines) > 3 else (lines[-1] if len(lines) > 1 else "")
-                href  = await card.get_attribute("href") or ""
-                url   = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
-                events.append({
-                    "title": title, "venue": venue,
-                    "price": price, "url": url,
-                    "source": "BookMyShow"
-                })
+                seen.add(title)
+                href = await card.get_attribute("href") or ""
+                url  = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
+                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "BookMyShow"})
             except Exception:
                 continue
     except Exception as e:
         print(f"   ⚠️  [BMS] Error: {e}")
+        await capture_debug(page, "BMS-error")
     finally:
-        await context.close()
-
-    print(f"✅ [BMS] {len(events)} unique events")
+        await ctx.close()
+    print(f"✅ [BMS] {len(events)} events")
     return events
 
 
 # ── Skillboxes ────────────────────────────────────────────────────────────────
 
 async def scrape_skillboxes(browser: Browser) -> list[dict]:
-    events = []
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 900},
-    )
-    page = await context.new_page()
+    events: list[dict] = []
+    ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 900})
+    page = await ctx.new_page()
     print("🌐 [Skillboxes] Navigating...")
     try:
-        await page.goto(SKILLBOXES_URL, wait_until="networkidle", timeout=60000)
+        await page.goto(SKILLBOXES_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # Scroll to trigger lazy loading
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await page.wait_for_timeout(1200)
+        # Give JS extra time to hydrate
+        await page.wait_for_timeout(5000)
+        await slow_scroll(page, rounds=6, delay_ms=1500)
 
-        # Skillboxes event cards are typically anchor tags linking to /e/ or /event/ paths
-        # Try multiple selector patterns to be resilient
-        card_els = (
-            await page.query_selector_all('a[href*="/e/"]') or
-            await page.query_selector_all('a[href*="/event/"]') or
-            await page.query_selector_all('[class*="event-card"] a') or
-            await page.query_selector_all('[class*="EventCard"] a') or
-            await page.query_selector_all('[class*="card"] a[href]')
-        )
-        print(f"   ↳ {len(card_els)} cards found")
+        html_len = len(await page.content())
+        print(f"   ↳ Page content length after hydration: {html_len} chars")
 
-        seen_titles: set[str] = set()
+        # Strategy 1: known event URL patterns
+        selectors_to_try = [
+            'a[href*="/e/"]',
+            'a[href*="/event/"]',
+            '[class*="event"] a[href]',
+            '[class*="Event"] a[href]',
+            '[class*="card"] a[href]',
+            '[class*="Card"] a[href]',
+            '[class*="listing"] a[href]',
+            '[class*="tile"] a[href]',
+        ]
+
+        card_els = []
+        for sel in selectors_to_try:
+            found = await page.query_selector_all(sel)
+            if found:
+                print(f"   ↳ Selector '{sel}' → {len(found)} elements")
+                card_els = found
+                break
+
+        # Strategy 2: all anchors filtered by path pattern
+        if not card_els:
+            print("   ↳ No selector matched; falling back to all anchors")
+            all_anchors = await page.query_selector_all('a[href]')
+            print(f"   ↳ Total anchors on page: {len(all_anchors)}")
+            for a in all_anchors:
+                href = (await a.get_attribute("href") or "").lower()
+                if any(p in href for p in ["/e/", "/event/", "skillboxes.com/e", "skillboxes.com/event"]):
+                    card_els.append(a)
+            print(f"   ↳ Filtered event anchors: {len(card_els)}")
+
+        if not card_els:
+            print("   ⚠️  [Skillboxes] No event links found. Dumping HTML for diagnosis:")
+            content = await page.content()
+            print(content[:2000])
+            await capture_debug(page, "Skillboxes-no-cards")
+
+        seen: set[str] = set()
         for card in card_els:
             try:
-                inner_text = await card.inner_text()
-                lines = [l.strip() for l in inner_text.strip().split('\n') if l.strip()]
-                if not lines:
+                raw = await card.inner_text()
+                lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+                if not lines or len(lines[0]) < 3:
                     continue
-                title = lines[0]
-                if not title or title in seen_titles or len(title) < 3:
+                title, venue, price = parse_card_lines(lines)
+                if not title or title in seen:
                     continue
-                seen_titles.add(title)
-                venue = next((l for l in lines[1:] if l and not l.startswith("₹")), "Venue TBA")
-                price = next((l for l in lines if "₹" in l or l.lower().startswith("free")), "")
-                href  = await card.get_attribute("href") or ""
-                url   = href if href.startswith("http") else f"https://www.skillboxes.com{href}"
-                events.append({
-                    "title": title, "venue": venue,
-                    "price": price, "url": url,
-                    "source": "Skillboxes"
-                })
+                seen.add(title)
+                href = await card.get_attribute("href") or ""
+                url  = href if href.startswith("http") else f"https://www.skillboxes.com{href}"
+                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "Skillboxes"})
             except Exception:
                 continue
 
-        # Fallback: if selectors above returned nothing, try scraping visible text blocks
-        if not events:
-            print("   ↳ Selector fallback: trying broader card search...")
-            card_els = await page.query_selector_all('a[href]')
-            seen_titles = set()
-            for card in card_els:
-                try:
-                    href = await card.get_attribute("href") or ""
-                    # Skip nav/footer/social links
-                    if not href or href in ("#", "/") or "skillboxes.com" not in href and not href.startswith("/e"):
-                        continue
-                    inner_text = await card.inner_text()
-                    lines = [l.strip() for l in inner_text.strip().split('\n') if l.strip()]
-                    if not lines or len(lines[0]) < 5:
-                        continue
-                    title = lines[0]
-                    if title in seen_titles:
-                        continue
-                    seen_titles.add(title)
-                    url = href if href.startswith("http") else f"https://www.skillboxes.com{href}"
-                    events.append({
-                        "title": title, "venue": lines[1] if len(lines) > 1 else "Venue TBA",
-                        "price": next((l for l in lines if "₹" in l or "free" in l.lower()), ""),
-                        "url": url, "source": "Skillboxes"
-                    })
-                except Exception:
-                    continue
-
     except Exception as e:
         print(f"   ⚠️  [Skillboxes] Error: {e}")
+        await capture_debug(page, "Skillboxes-error")
     finally:
-        await context.close()
-
-    print(f"✅ [Skillboxes] {len(events)} unique events")
+        await ctx.close()
+    print(f"✅ [Skillboxes] {len(events)} events")
     return events
 
 
 # ── District ──────────────────────────────────────────────────────────────────
 
 async def scrape_district(browser: Browser) -> list[dict]:
-    events = []
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 900},
-    )
-    page = await context.new_page()
+    events: list[dict] = []
+    ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 900})
+    page = await ctx.new_page()
     print("🌐 [District] Navigating...")
     try:
-        await page.goto(DISTRICT_URL, wait_until="networkidle", timeout=60000)
+        await page.goto(DISTRICT_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # Wait for event content to render
-        try:
-            await page.wait_for_selector('a[href*="/events/"]', timeout=20000)
-        except Exception:
-            # District may use a different structure; continue anyway
-            pass
+        # District is a heavy React SPA — needs extra hydration time
+        await page.wait_for_timeout(6000)
+        await slow_scroll(page, rounds=6, delay_ms=1500)
 
-        # Scroll to load more events
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await page.wait_for_timeout(1200)
+        html_len = len(await page.content())
+        print(f"   ↳ Page content length after hydration: {html_len} chars")
 
-        # District event links go to /events/<slug>
-        card_els = (
-            await page.query_selector_all('a[href*="/events/"]') or
-            await page.query_selector_all('[class*="event"] a') or
-            await page.query_selector_all('[class*="card"] a[href]')
-        )
-        print(f"   ↳ {len(card_els)} cards found")
+        # District event URLs end with /event
+        selectors_to_try = [
+            'a[href$="/event"]',
+            'a[href*="/event"]',
+            '[class*="event-card"] a',
+            '[class*="EventCard"] a',
+            '[class*="event_card"] a',
+            '[class*="listing"] a[href]',
+            '[class*="card"] a[href]',
+        ]
 
-        seen_titles: set[str] = set()
+        card_els = []
+        for sel in selectors_to_try:
+            found = await page.query_selector_all(sel)
+            if found:
+                print(f"   ↳ Selector '{sel}' → {len(found)} elements")
+                card_els = found
+                break
+
+        # Fallback: all anchors with /event in path
+        if not card_els:
+            print("   ↳ No selector matched; falling back to all anchors")
+            all_anchors = await page.query_selector_all('a[href]')
+            print(f"   ↳ Total anchors on page: {len(all_anchors)}")
+            for a in all_anchors:
+                href = (await a.get_attribute("href") or "").lower()
+                if href.endswith("/event") or "/event?" in href:
+                    card_els.append(a)
+            print(f"   ↳ Filtered event anchors: {len(card_els)}")
+
+        if not card_els:
+            print("   ⚠️  [District] No event links found. Dumping HTML for diagnosis:")
+            content = await page.content()
+            print(content[:2000])
+            await capture_debug(page, "District-no-cards")
+
+        SKIP_TITLES = {
+            "events", "music", "mumbai", "district", "home", "search",
+            "sign in", "login", "download", "terms", "privacy", "contact"
+        }
+
+        seen: set[str] = set()
         for card in card_els:
             try:
-                inner_text = await card.inner_text()
-                lines = [l.strip() for l in inner_text.strip().split('\n') if l.strip()]
-                if not lines:
+                raw = await card.inner_text()
+                lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+                if not lines or len(lines[0]) < 4:
                     continue
-                title = lines[0]
-                # Skip generic navigation links
-                if not title or title in seen_titles or len(title) < 4:
+                title, venue, price = parse_card_lines(lines)
+                if not title or title in seen or title.lower() in SKIP_TITLES:
                     continue
-                if title.lower() in {"events", "music", "mumbai", "district", "home"}:
+                href = await card.get_attribute("href") or ""
+                url  = href if href.startswith("http") else f"https://www.district.in{href}"
+                if url.rstrip("/") == DISTRICT_URL.rstrip("/"):
                     continue
-                seen_titles.add(title)
-                venue = next((l for l in lines[1:] if l and not l.startswith("₹") and len(l) > 3), "Venue TBA")
-                price = next((l for l in lines if "₹" in l or l.lower().startswith("free")), "")
-                href  = await card.get_attribute("href") or ""
-                url   = href if href.startswith("http") else f"https://www.district.in{href}"
-                # Skip the category page link itself
-                if url == DISTRICT_URL:
-                    continue
-                events.append({
-                    "title": title, "venue": venue,
-                    "price": price, "url": url,
-                    "source": "District"
-                })
+                seen.add(title)
+                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "District"})
             except Exception:
                 continue
 
     except Exception as e:
         print(f"   ⚠️  [District] Error: {e}")
+        await capture_debug(page, "District-error")
     finally:
-        await context.close()
-
-    print(f"✅ [District] {len(events)} unique events")
+        await ctx.close()
+    print(f"✅ [District] {len(events)} events")
     return events
 
 
@@ -244,7 +279,6 @@ async def scrape_all_events() -> list[dict]:
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
-        # Run all three scrapers concurrently
         bms_events, skillboxes_events, district_events = await asyncio.gather(
             scrape_bms(browser),
             scrape_skillboxes(browser),
@@ -253,11 +287,12 @@ async def scrape_all_events() -> list[dict]:
         await browser.close()
 
     all_events = bms_events + skillboxes_events + district_events
-    print(f"\n📊 Total scraped: {len(all_events)} events across 3 sources")
+    print(f"\n📊 Total: {len(all_events)} events  "
+          f"(BMS={len(bms_events)}, Skillboxes={len(skillboxes_events)}, District={len(district_events)})")
     return all_events
 
 
-# ── Snapshot helpers ──────────────────────────────────────────────────────────
+# ── Snapshot ──────────────────────────────────────────────────────────────────
 
 def load_known_events() -> set[str]:
     if os.path.exists(SNAPSHOT_FILE):
@@ -268,56 +303,59 @@ def load_known_events() -> set[str]:
 
 def save_known_events(titles: set[str]) -> None:
     with open(SNAPSHOT_FILE, "w") as f:
-        json.dump(list(titles), f, indent=2)
+        json.dump(sorted(titles), f, indent=2)
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
 SOURCE_COLORS = {
     "BookMyShow": "#e2163b",
-    "Skillboxes": "#6c3cff",
-    "District":   "#ff6b00",
+    "Skillboxes":  "#6c3cff",
+    "District":    "#ff6b00",
 }
 
-def build_source_section(source: str, events: list[dict]) -> str:
+
+def build_source_section(source: str, evs: list[dict]) -> str:
     color = SOURCE_COLORS.get(source, "#333")
-    rows = ""
-    for ev in events:
-        rows += f"""
+    rows = "".join(f"""
         <tr>
           <td style="padding:10px 12px;border-bottom:1px solid #eee;">
             <a href="{ev['url']}" style="font-weight:600;color:{color};text-decoration:none;">{ev['title']}</a>
           </td>
           <td style="padding:10px 12px;border-bottom:1px solid #eee;color:#555;">{ev['venue']}</td>
-          <td style="padding:10px 12px;border-bottom:1px solid #eee;color:#27ae60;">{ev.get('price', '')}</td>
-        </tr>"""
-
+          <td style="padding:10px 12px;border-bottom:1px solid #eee;color:#27ae60;">{ev.get('price','')}</td>
+        </tr>""" for ev in evs)
     return f"""
     <h3 style="color:{color};margin-top:28px;border-left:4px solid {color};padding-left:10px;">
-      {source} &nbsp;<span style="font-size:13px;font-weight:normal;color:#888;">({len(events)} new)</span>
+      {source} <span style="font-size:13px;font-weight:normal;color:#888;">({len(evs)} new)</span>
     </h3>
     <table width="100%" style="border-collapse:collapse;font-size:14px;">
-      <thead>
-        <tr style="background:#f5f5f5;">
-          <th style="padding:10px 12px;text-align:left;">Event</th>
-          <th style="padding:10px 12px;text-align:left;">Venue</th>
-          <th style="padding:10px 12px;text-align:left;">Price</th>
-        </tr>
-      </thead>
+      <thead><tr style="background:#f5f5f5;">
+        <th style="padding:10px 12px;text-align:left;">Event</th>
+        <th style="padding:10px 12px;text-align:left;">Venue</th>
+        <th style="padding:10px 12px;text-align:left;">Price</th>
+      </tr></thead>
       <tbody>{rows}</tbody>
     </table>"""
 
 
+def build_debug_section() -> str:
+    if not _debug_screenshots:
+        return ""
+    imgs = "".join(
+        f'<p><strong>{s["label"]}</strong><br>'
+        f'<img src="data:image/png;base64,{s["data"]}" style="max-width:100%;border:1px solid #ddd;"></p>'
+        for s in _debug_screenshots
+    )
+    return f'<h3 style="color:#cc0000;margin-top:28px;">🐛 Debug Screenshots</h3>{imgs}'
+
+
 def send_email(new_events: list[dict]) -> None:
-    # Group by source
     by_source: dict[str, list[dict]] = {}
     for ev in new_events:
         by_source.setdefault(ev["source"], []).append(ev)
 
-    sections = "".join(
-        build_source_section(src, evs)
-        for src, evs in by_source.items()
-    )
+    sections = "".join(build_source_section(src, evs) for src, evs in by_source.items())
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:720px;margin:auto;padding:20px;">
@@ -328,15 +366,14 @@ def send_email(new_events: list[dict]) -> None:
         {datetime.now().strftime('%d %b %Y, %I:%M %p')} UTC.
       </p>
       {sections}
+      {build_debug_section()}
       <p style="margin-top:30px;font-size:12px;color:#aaa;">
-        Auto-generated by your Mumbai Music Scraper 🤖 &nbsp;|&nbsp;
-        Sources: BookMyShow · Skillboxes · District
+        Auto-generated 🤖 &nbsp;|&nbsp; Sources: BookMyShow · Skillboxes · District
       </p>
-    </body></html>
-    """
+    </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎵 {len(new_events)} New Music Event(s) in Mumbai! ({', '.join(by_source)})"
+    msg["Subject"] = f"🎵 {len(new_events)} New Event(s) in Mumbai! ({', '.join(by_source)})"
     msg["From"]    = SENDER_EMAIL
     msg["To"]      = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -347,6 +384,28 @@ def send_email(new_events: list[dict]) -> None:
     print(f"📧 Email sent → {RECIPIENT_EMAIL}")
 
 
+def send_debug_email() -> None:
+    if not _debug_screenshots:
+        return
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:720px;margin:auto;padding:20px;">
+      <h2 style="color:#cc0000;">🐛 Scraper Debug Report</h2>
+      <p>Scrapers ran on {datetime.now().strftime('%d %b %Y, %I:%M %p')} UTC — screenshots attached below.</p>
+      {build_debug_section()}
+    </body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "🐛 Mumbai Scraper — Debug Screenshots"
+    msg["From"]    = SENDER_EMAIL
+    msg["To"]      = RECIPIENT_EMAIL
+    msg.attach(MIMEText(html, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+    print(f"📧 Debug email sent → {RECIPIENT_EMAIL}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
@@ -355,6 +414,8 @@ async def main():
 
     if not scraped:
         print("⚠️ No events scraped from any source.")
+        if DEBUG:
+            send_debug_email()
         return
 
     new_events = [ev for ev in scraped if ev["title"] not in known]
@@ -364,6 +425,8 @@ async def main():
         send_email(new_events)
     else:
         print("✅ No new events since last check.")
+        if DEBUG and _debug_screenshots:
+            send_debug_email()
 
     save_known_events(known | {ev["title"] for ev in scraped})
     print("💾 Snapshot updated")
