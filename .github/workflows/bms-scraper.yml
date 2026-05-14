@@ -1,9 +1,18 @@
-name: BookMyShow Event Scraper
+name: Mumbai Music Event Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # Runs daily at 6:00 AM UTC (11:30 AM IST)
-  workflow_dispatch:        # Allows manual trigger from GitHub UI
+    - cron: '0 6 * * *'   # Daily at 6:00 AM UTC (11:30 AM IST)
+  workflow_dispatch:        # Manual trigger from GitHub UI
+    inputs:
+      debug:
+        description: 'Set to 1 to email debug screenshots'
+        required: false
+        default: '0'
+
+# ← This is the fix for the 403 push error
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -29,12 +38,13 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          DEBUG: ${{ github.event.inputs.debug || '0' }}
         run: python scraper.py
 
-      - name: Commit updated snapshot  # ← THIS IS WHAT WAS MISSING
+      - name: Commit updated snapshot
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add known_events.json
-          git diff --cached --quiet || git commit -m "Update event snapshot"
+          git diff --cached --quiet || git commit -m "chore: update event snapshot [skip ci]"
           git push
