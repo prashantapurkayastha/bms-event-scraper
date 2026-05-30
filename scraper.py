@@ -431,7 +431,8 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
                         break
 
                 all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
-                _, venue, price = parse_card_lines(all_lines)
+                 print(f"DEBUG all_lines: {all_lines}")  # ← add this
+                   _, venue, price = parse_card_lines(all_lines)
 
                 seen.add(title)
                 href = await card.get_attribute("href") or ""
