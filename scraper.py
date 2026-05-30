@@ -20,6 +20,7 @@ DEBUG = os.environ.get("DEBUG", "0") == "1"
 BMS_URL        = "https://in.bookmyshow.com/explore/events-mumbai?categories=music-shows"
 SKILLBOXES_URL = "https://www.skillboxes.com/events-mumbai"
 DISTRICT_URL   = "https://www.district.in/events/music-in-mumbai-book-tickets"
+SORTMYSCENE_URL = "https://sortmyscene.com/events?tab=events&city=Mumbai"
 SNAPSHOT_FILE  = "known_events.json"
 
 USER_AGENT = (
@@ -345,7 +346,109 @@ async def scrape_district(browser: Browser) -> list[dict]:
         await ctx.close()
     print(f"✅ [District] {len(events)} events")
     return events
+    
+# ── SortMyScene ───────────────────────────────────────────────────────────────
 
+SORTMYSCENE_URL = "https://sortmyscene.com/events?tab=events&city=Mumbai"
+
+async def scrape_sortmyscene(browser: Browser) -> list[dict]:
+    events: list[dict] = []
+    ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 900})
+    page = await ctx.new_page()
+    print("🌐 [SortMyScene] Navigating...")
+    try:
+        await page.goto(SORTMYSCENE_URL, wait_until="domcontentloaded", timeout=60000)
+
+        # Heavy React SPA — needs hydration time
+        await page.wait_for_timeout(6000)
+        await slow_scroll(page, rounds=6, delay_ms=1500)
+
+        html_len = len(await page.content())
+        print(f"   ↳ Page content length after hydration: {html_len} chars")
+
+        selectors_to_try = [
+            'a[href*="/e/"]',
+            'a[href*="/event/"]',
+            'a[href*="/events/"]',
+            '[class*="event"] a[href]',
+            '[class*="Event"] a[href]',
+            '[class*="card"] a[href]',
+            '[class*="Card"] a[href]',
+            '[class*="listing"] a[href]',
+            '[class*="tile"] a[href]',
+        ]
+
+        card_els = []
+        for sel in selectors_to_try:
+            found = await page.query_selector_all(sel)
+            if found:
+                print(f"   ↳ Selector '{sel}' → {len(found)} elements")
+                card_els = found
+                break
+
+        # Fallback: all anchors filtered by path
+        if not card_els:
+            print("   ↳ No selector matched; falling back to all anchors")
+            all_anchors = await page.query_selector_all('a[href]')
+            print(f"   ↳ Total anchors on page: {len(all_anchors)}")
+            for a in all_anchors:
+                href = (await a.get_attribute("href") or "").lower()
+                if any(p in href for p in ["/e/", "/event/", "/events/", "sortmyscene.com/e"]):
+                    card_els.append(a)
+            print(f"   ↳ Filtered event anchors: {len(card_els)}")
+
+        if not card_els:
+            print("   ⚠️  [SortMyScene] No event links found. Dumping HTML snippet:")
+            print((await page.content())[:2000])
+            await capture_debug(page, "SortMyScene-no-cards")
+
+        SKIP_TITLES = {
+            "events", "music", "mumbai", "sortmyscene", "home", "search",
+            "sign in", "login", "download", "terms", "privacy", "contact", "nightlife"
+        }
+
+        seen: set[str] = set()
+        for card in card_els:
+            try:
+                title_text = (await card.inner_text()).strip()
+                lines = [l.strip() for l in title_text.splitlines() if l.strip()]
+                title = lines[0] if lines else ""
+                if not title or len(title) < 3 or title in seen or title.lower() in SKIP_TITLES:
+                    continue
+
+                # Walk up DOM to find card container with venue/price siblings
+                container_text = title_text
+                for level in range(1, 5):
+                    ancestor = await card.evaluate_handle(
+                        f"el => {{ let n = el; for(let i=0;i<{level};i++) n = n.parentElement; return n; }}"
+                    )
+                    if not ancestor:
+                        break
+                    parent_text = await (await ancestor.get_property("innerText")).json_value()
+                    parent_lines = [l.strip() for l in (parent_text or "").splitlines() if l.strip()]
+                    if 2 <= len(parent_lines) <= 12:
+                        container_text = parent_text
+                        break
+
+                all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
+                _, venue, price = parse_card_lines(all_lines)
+
+                seen.add(title)
+                href = await card.get_attribute("href") or ""
+                url = href if href.startswith("http") else f"https://sortmyscene.com{href}"
+                if url.rstrip("/") == SORTMYSCENE_URL.rstrip("/"):
+                    continue
+                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "SortMyScene"})
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"   ⚠️  [SortMyScene] Error: {e}")
+        await capture_debug(page, "SortMyScene-error")
+    finally:
+        await ctx.close()
+    print(f"✅ [SortMyScene] {len(events)} events")
+    return events
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
@@ -355,16 +458,18 @@ async def scrape_all_events() -> list[dict]:
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
-        bms_events, skillboxes_events, district_events = await asyncio.gather(
+        bms_events, skillboxes_events, district_events, sms_events = await asyncio.gather(
             scrape_bms(browser),
             scrape_skillboxes(browser),
             scrape_district(browser),
+            scrape_sortmyscene(browser),
         )
         await browser.close()
 
-    all_events = bms_events + skillboxes_events + district_events
+    all_events = bms_events + skillboxes_events + district_events + sms_events
     print(f"\n📊 Total: {len(all_events)} events  "
-          f"(BMS={len(bms_events)}, Skillboxes={len(skillboxes_events)}, District={len(district_events)})")
+          f"(BMS={len(bms_events)}, Skillboxes={len(skillboxes_events)}, "
+          f"District={len(district_events)}, SortMyScene={len(sms_events)})")
     return all_events
 
 
@@ -388,6 +493,7 @@ SOURCE_COLORS = {
     "BookMyShow": "#e2163b",
     "Skillboxes":  "#6c3cff",
     "District":    "#ff6b00",
+    "SortMyScene": "#ff3c6e"
 }
 
 
