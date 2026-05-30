@@ -431,15 +431,14 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
                         break
 
                 all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
-                print(f"DEBUG all_lines: {all_lines}")  # ← add this
-                _, venue, price = parse_card_lines(all_lines)
+                title, venue, price, date = parse_district_card(all_lines)
 
                 seen.add(title)
                 href = await card.get_attribute("href") or ""
                 url = href if href.startswith("http") else f"https://sortmyscene.com{href}"
                 if url.rstrip("/") == SORTMYSCENE_URL.rstrip("/"):
                     continue
-                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "SortMyScene"})
+                events.append({"title": title, "venue": venue, "price": price, "date": date, "url": url, "source": "SortMyScene"})
             except Exception:
                 continue
 
