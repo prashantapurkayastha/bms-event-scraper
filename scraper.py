@@ -189,6 +189,7 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
                         break
 
                 all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
+                print(f"DEBUG SMS all_lines: {all_lines}")  # ← add this
 
                 # Skillboxes card text order (confirmed from screenshot):
                 #   line[0] = event title
