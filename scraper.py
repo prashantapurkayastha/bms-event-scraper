@@ -17,11 +17,11 @@ RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 # Set DEBUG=1 in env to attach screenshots to the email on scrape failure
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-BMS_URL        = "https://in.bookmyshow.com/explore/events-mumbai?categories=music-shows"
-SKILLBOXES_URL = "https://www.skillboxes.com/events-mumbai"
-DISTRICT_URL   = "https://www.district.in/events/music-in-mumbai-book-tickets"
+BMS_URL         = "https://in.bookmyshow.com/explore/events-mumbai?categories=music-shows"
+SKILLBOXES_URL  = "https://www.skillboxes.com/events-mumbai"
+DISTRICT_URL    = "https://www.district.in/events/music-in-mumbai-book-tickets"
 SORTMYSCENE_URL = "https://sortmyscene.com/events?tab=events&city=Mumbai"
-SNAPSHOT_FILE  = "known_events.json"
+SNAPSHOT_FILE   = "known_events.json"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -69,6 +69,26 @@ def parse_card_lines(lines: list[str]) -> tuple[str, str, str]:
     return title, venue, price
 
 
+def parse_pipe_card(all_lines: list[str]) -> tuple[str, str, str, str]:
+    """
+    Parser for Skillboxes and SortMyScene cards.
+    Card structure:
+        all_lines[0] = category  e.g. "Club Gigs - Music"
+        all_lines[1] = title     e.g. "Friday Night Live – Edition 33"
+        all_lines[2] = location  e.g. "Mumbai | India | 05 June 2026 | 09:00 PM"
+    """
+    title = all_lines[1] if len(all_lines) > 1 else (all_lines[0] if all_lines else "")
+    date_venue = all_lines[2] if len(all_lines) > 2 else ""
+    parts = [p.strip() for p in date_venue.split("|")]
+    venue = parts[0] if parts else "Venue TBA"   # "Mumbai"
+    date  = parts[2] if len(parts) > 2 else ""   # "05 June 2026"
+    price = next(
+        (l for l in all_lines if "₹" in l or l.lower().startswith("free")),
+        ""
+    )
+    return title, venue, price, date
+
+
 # ── BookMyShow ────────────────────────────────────────────────────────────────
 
 async def scrape_bms(browser: Browser) -> list[dict]:
@@ -78,12 +98,17 @@ async def scrape_bms(browser: Browser) -> list[dict]:
     print("🌐 [BMS] Navigating...")
     try:
         await page.goto(BMS_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_selector('a[href*="/events/"]', timeout=30000)
+        await page.wait_for_timeout(4000)
+        await page.wait_for_selector('a[href]', timeout=30000)
         await slow_scroll(page)
 
         seen: set[str] = set()
-        for card in await page.query_selector_all('a[href*="/events/"]'):
+        all_anchors = await page.query_selector_all('a[href]')
+        for card in all_anchors:
             try:
+                href = await card.get_attribute("href") or ""
+                if "/events/" not in href:
+                    continue
                 raw = await card.inner_text()
                 lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
                 if not lines:
@@ -92,8 +117,7 @@ async def scrape_bms(browser: Browser) -> list[dict]:
                 if not title or title in seen:
                     continue
                 seen.add(title)
-                href = await card.get_attribute("href") or ""
-                url  = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
+                url = href if href.startswith("http") else f"https://in.bookmyshow.com{href}"
                 events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "BookMyShow"})
             except Exception:
                 continue
@@ -115,15 +139,12 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
     print("🌐 [Skillboxes] Navigating...")
     try:
         await page.goto(SKILLBOXES_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Give JS extra time to hydrate
         await page.wait_for_timeout(5000)
         await slow_scroll(page, rounds=6, delay_ms=1500)
 
         html_len = len(await page.content())
         print(f"   ↳ Page content length after hydration: {html_len} chars")
 
-        # Strategy 1: known event URL patterns
         selectors_to_try = [
             'a[href*="/e/"]',
             'a[href*="/event/"]',
@@ -143,7 +164,6 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
                 card_els = found
                 break
 
-        # Strategy 2: all anchors filtered by path pattern
         if not card_els:
             print("   ↳ No selector matched; falling back to all anchors")
             all_anchors = await page.query_selector_all('a[href]')
@@ -156,25 +176,19 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
 
         if not card_els:
             print("   ⚠️  [Skillboxes] No event links found. Dumping HTML for diagnosis:")
-            content = await page.content()
-            print(content[:2000])
+            print((await page.content())[:2000])
             await capture_debug(page, "Skillboxes-no-cards")
 
         seen: set[str] = set()
         for card in card_els:
             try:
                 href = await card.get_attribute("href") or ""
-                # The <a> tag may only contain the title.
-                # Walk up the DOM to find the card container that holds venue/price siblings.
-                # Try up to 4 ancestor levels to find a node with more content.
                 title_text = (await card.inner_text()).strip()
                 lines = [l.strip() for l in title_text.splitlines() if l.strip()]
-                title = lines[0] if lines else ""
-                print(f"DEBUG title={title!r} lines={lines}")  # ← add here
-                if not title or len(title) < 3 or title in seen:
+                if not lines:
                     continue
 
-                # Walk up DOM looking for a parent that has venue/price text
+                # Walk up DOM to find card container with full text
                 container_text = title_text
                 for level in range(1, 5):
                     ancestor = await card.evaluate_handle(
@@ -184,37 +198,21 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
                         break
                     parent_text = await (await ancestor.get_property("innerText")).json_value()
                     parent_lines = [l.strip() for l in (parent_text or "").splitlines() if l.strip()]
-                    # Accept this level if it adds venue/price without bloating too much
-                    if len(parent_lines) >= 2 and len(parent_lines) <= 12:
+                    if 2 <= len(parent_lines) <= 12:
                         container_text = parent_text
                         break
 
                 all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
-                print(f"DEBUG SMS all_lines: {all_lines}")  # ← add this
 
-                # Skillboxes card text order (confirmed from screenshot):
-                #   line[0] = event title
-                #   remaining lines may contain venue, date, price in varying order
-                venue = next(
-                    (l for l in all_lines[1:] if l and "₹" not in l
-                     and not l.lower().startswith("free")
-                     and not any(d in l.lower() for d in ["onwards","seats","left","sold"])
-                     and len(l) > 3),
-                    "Venue TBA"
-                )
-                price = next(
-                    (l for l in all_lines if "₹" in l or l.lower().startswith("free")),
-                    ""
-                )
-                # Handle "₹500\nonwards" split across lines
-                if price:
-                    idx = all_lines.index(price)
-                    if idx + 1 < len(all_lines) and all_lines[idx+1].lower() == "onwards":
-                        price = f"{price} onwards"
+                # Skillboxes: category | title | "City | Country | Date | Time"
+                title, venue, price, date = parse_pipe_card(all_lines)
+
+                if not title or len(title) < 3 or title in seen:
+                    continue
 
                 seen.add(title)
                 url = href if href.startswith("http") else f"https://www.skillboxes.com{href}"
-                events.append({"title": title, "venue": venue, "price": price, "url": url, "source": "Skillboxes"})
+                events.append({"title": title, "venue": venue, "price": price, "date": date, "url": url, "source": "Skillboxes"})
             except Exception:
                 continue
 
@@ -236,15 +234,12 @@ async def scrape_district(browser: Browser) -> list[dict]:
     print("🌐 [District] Navigating...")
     try:
         await page.goto(DISTRICT_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # District is a heavy React SPA — needs extra hydration time
         await page.wait_for_timeout(6000)
         await slow_scroll(page, rounds=6, delay_ms=1500)
 
         html_len = len(await page.content())
         print(f"   ↳ Page content length after hydration: {html_len} chars")
 
-        # District event URLs end with /event
         selectors_to_try = [
             'a[href$="/event"]',
             'a[href*="/event"]',
@@ -263,7 +258,6 @@ async def scrape_district(browser: Browser) -> list[dict]:
                 card_els = found
                 break
 
-        # Fallback: all anchors with /event in path
         if not card_els:
             print("   ↳ No selector matched; falling back to all anchors")
             all_anchors = await page.query_selector_all('a[href]')
@@ -276,8 +270,7 @@ async def scrape_district(browser: Browser) -> list[dict]:
 
         if not card_els:
             print("   ⚠️  [District] No event links found. Dumping HTML for diagnosis:")
-            content = await page.content()
-            print(content[:2000])
+            print((await page.content())[:2000])
             await capture_debug(page, "District-no-cards")
 
         SKIP_TITLES = {
@@ -285,13 +278,7 @@ async def scrape_district(browser: Browser) -> list[dict]:
             "sign in", "login", "download", "terms", "privacy", "contact"
         }
 
-        # District card text order (confirmed from screenshot):
-        #   lines[0] = date/time  e.g. "Sat, 16 May, 8:45 PM"
-        #   lines[1] = event name e.g. "Unplugged Night ft. Chitranshu"
-        #   lines[2] = venue      e.g. "Candlelight Singalong | Lyla"
-        #   lines[-1] = price     e.g. "₹200"  (may be absent)
         def parse_district_card(lines: list[str]) -> tuple[str, str, str, str]:
-            # Detect if first line looks like a date (contains a month name or day name)
             DATE_HINTS = {"mon","tue","wed","thu","fri","sat","sun","jan","feb","mar",
                           "apr","may","jun","jul","aug","sep","oct","nov","dec","every"}
             first_lower = lines[0].lower() if lines else ""
@@ -306,7 +293,6 @@ async def scrape_district(browser: Browser) -> list[dict]:
                 title = lines[0]
                 venue = lines[1] if len(lines) > 1 else "Venue TBA"
 
-            # Price: last line containing ₹ or "free", or join last two lines for "₹1800\nonwards"
             price_lines = [l for l in lines if "₹" in l or l.lower().startswith("free") or l.lower() == "onwards"]
             if len(price_lines) >= 2 and price_lines[-1].lower() == "onwards":
                 price = f"{price_lines[-2]} onwards"
@@ -315,7 +301,6 @@ async def scrape_district(browser: Browser) -> list[dict]:
             else:
                 price = ""
 
-            # Clean venue: strip price-like content
             if "₹" in venue or venue.lower().startswith("free"):
                 venue = "Venue TBA"
 
@@ -348,10 +333,9 @@ async def scrape_district(browser: Browser) -> list[dict]:
         await ctx.close()
     print(f"✅ [District] {len(events)} events")
     return events
-    
-# ── SortMyScene ───────────────────────────────────────────────────────────────
 
-SORTMYSCENE_URL = "https://sortmyscene.com/events?tab=events&city=Mumbai"
+
+# ── SortMyScene ───────────────────────────────────────────────────────────────
 
 async def scrape_sortmyscene(browser: Browser) -> list[dict]:
     events: list[dict] = []
@@ -360,8 +344,6 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
     print("🌐 [SortMyScene] Navigating...")
     try:
         await page.goto(SORTMYSCENE_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Heavy React SPA — needs hydration time
         await page.wait_for_timeout(6000)
         await slow_scroll(page, rounds=6, delay_ms=1500)
 
@@ -388,7 +370,6 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
                 card_els = found
                 break
 
-        # Fallback: all anchors filtered by path
         if not card_els:
             print("   ↳ No selector matched; falling back to all anchors")
             all_anchors = await page.query_selector_all('a[href]')
@@ -414,11 +395,10 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
             try:
                 title_text = (await card.inner_text()).strip()
                 lines = [l.strip() for l in title_text.splitlines() if l.strip()]
-                title = lines[0] if lines else ""
-                if not title or len(title) < 3 or title in seen or title.lower() in SKIP_TITLES:
+                if not lines:
                     continue
 
-                # Walk up DOM to find card container with venue/price siblings
+                # Walk up DOM to find card container with full text
                 container_text = title_text
                 for level in range(1, 5):
                     ancestor = await card.evaluate_handle(
@@ -433,14 +413,20 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
                         break
 
                 all_lines = [l.strip() for l in container_text.splitlines() if l.strip()]
-                title, venue, price, date = parse_district_card(all_lines)
+
+                # SortMyScene: category | title | "City | Country | Date | Time"
+                title, venue, price, date = parse_pipe_card(all_lines)
+
+                if not title or len(title) < 3 or title in seen or title.lower() in SKIP_TITLES:
+                    continue
 
                 seen.add(title)
                 href = await card.get_attribute("href") or ""
                 url = href if href.startswith("http") else f"https://sortmyscene.com{href}"
                 if url.rstrip("/") == SORTMYSCENE_URL.rstrip("/"):
                     continue
-                events.append({"title": title, "venue": venue, "price": price, "date": date, "url": url, "source": "SortMyScene"})
+                events.append({"title": title, "venue": venue, "price": price,
+                               "date": date, "url": url, "source": "SortMyScene"})
             except Exception:
                 continue
 
@@ -451,6 +437,7 @@ async def scrape_sortmyscene(browser: Browser) -> list[dict]:
         await ctx.close()
     print(f"✅ [SortMyScene] {len(events)} events")
     return events
+
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
@@ -495,7 +482,7 @@ SOURCE_COLORS = {
     "BookMyShow": "#e2163b",
     "Skillboxes":  "#6c3cff",
     "District":    "#ff6b00",
-    "SortMyScene": "#ff3c6e"
+    "SortMyScene": "#ff3c6e",
 }
 
 
@@ -562,7 +549,7 @@ def send_email(new_events: list[dict]) -> None:
       {sections}
       {build_debug_section()}
       <p style="margin-top:30px;font-size:12px;color:#aaa;">
-        Auto-generated 🤖 &nbsp;|&nbsp; Sources: BookMyShow · Skillboxes · District
+        Auto-generated 🤖 &nbsp;|&nbsp; Sources: BookMyShow · Skillboxes · District · SortMyScene
       </p>
     </body></html>"""
 
