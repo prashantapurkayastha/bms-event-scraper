@@ -170,6 +170,7 @@ async def scrape_skillboxes(browser: Browser) -> list[dict]:
                 title_text = (await card.inner_text()).strip()
                 lines = [l.strip() for l in title_text.splitlines() if l.strip()]
                 title = lines[0] if lines else ""
+                print(f"DEBUG title={title!r} lines={lines}")  # ← add here
                 if not title or len(title) < 3 or title in seen:
                     continue
 
