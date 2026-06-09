@@ -98,12 +98,24 @@ async def scrape_bms(browser: Browser) -> list[dict]:
     print("🌐 [BMS] Navigating...")
     try:
         await page.goto(BMS_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
-        await page.wait_for_selector('a[href]', timeout=30000)
+        await page.wait_for_timeout(6000)
         await slow_scroll(page)
 
-        seen: set[str] = set()
+        html_len = len(await page.content())
+        print(f"   ↳ [BMS] Page content length: {html_len} chars")
+
         all_anchors = await page.query_selector_all('a[href]')
+        print(f"   ↳ [BMS] Total anchors found: {len(all_anchors)}")
+
+        # Sample hrefs to diagnose what the page actually loaded
+        sample_hrefs = []
+        for a in all_anchors[:20]:
+            href = await a.get_attribute("href") or ""
+            if href:
+                sample_hrefs.append(href)
+        print(f"   ↳ [BMS] Sample hrefs: {sample_hrefs[:10]}")
+
+        seen: set[str] = set()
         for card in all_anchors:
             try:
                 href = await card.get_attribute("href") or ""
